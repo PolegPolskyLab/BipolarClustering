@@ -1,0 +1,680 @@
+---
+title: "Clusters"
+author: "S Budoff"
+date: "11/15/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,message=FALSE)
+```
+
+# Clustering OFF Bipolar Cells
+
+## Clustering Parameters of interst
+
+Physiologic responses were collected by two photon microscopy and processed in IGOR as described previously. Data including responses at each time point and IGOR computed summary statistics for each response were then loaded into R. The time series data was then normalized by the respective peak response amplitude so various statistics of interest for clustering could be computed using these normalized responses.
+
+```{r load}
+# Load libraries
+library(tidyverse)
+library(googlesheets4)
+library(dplyr)
+library(ggplot2)
+
+# Raw data source
+url = "https://docs.google.com/spreadsheets/d/1LyuEU8tsYr53LDfgfPEDgc3mZHVGlS8KQjy0nIyzoZo/edit#gid=233400077"
+bp_type = "off_1_7"
+mspf = 19.5637
+# ms/frame
+# Load on data
+raw_df <- read_sheet(url, sheet = bp_type)
+
+#Store traces
+params <- raw_df %>%
+  select(-starts_with("t", ignore.case = F)) %>%
+  names()
+
+frames = length(select(raw_df, starts_with("ts", ignore.case = F)))
+time_ms = mspf * frames
+ts = seq(0,time_ms,length.out=frames)
+
+df_time <- raw_df %>%
+  mutate(ID = 1:nrow(raw_df)) %>%
+  gather(key = "Time", value = "Response", -ID, -all_of(params)) %>%
+  mutate(StimType = case_when(stringr::str_detect(Time, fixed("ts")) ~ "static",
+                             stringr::str_detect(Time, "tm") ~ "moving"),
+         Response = case_when(StimType == "static" ~ Response / peak ,
+                             StimType == "moving" ~ Response / peak), 
+         Time = as.numeric(stringr::str_sub(Time, 3)),
+         Time = ts[Time]) %>%
+  arrange(ID)
+
+# Visualize timeseries
+df_time %>%
+  group_by(ID) %>%
+  ungroup() %>%
+  ggplot(aes(x = Time, y = Response, group = ID, color = ID)) +
+    geom_line(alpha = 0.7)+
+    scale_color_gradient2(low = 'red', mid = 'green', high = 'purple', 
+                          midpoint = max(df_time$ID)/2) +
+    facet_wrap(~StimType) +
+    theme_minimal()
+
+```
+
+Noting the noise inherent in this physiologic data, a high pass filter was generated to extract the most extreme noise, and then a 10 frame rolling average filter was applied to make the data smoother for estimation of desired statistics, in particular, the area under the curve.
+
+```{r dataSmoothing, message=FALSE}
+# Perform HP filtering to remove excessively noisy obs
+bf <- signal::butter(n = 1, W = 1/10, type = "high")
+
+hp_time <- df_time %>%
+  group_by(ID) %>%
+  mutate(hp = signal::filter(x = Response, filt = bf))
+
+# Visualize high hp component
+hp_time %>%
+  filter(Time >3000) %>%
+  ggplot(aes(x = Time, y = hp, group = ID, color = ID)) +
+    geom_line()+
+    scale_color_gradient2(low = 'red', mid = 'green', high = 'purple', midpoint = max(df_time$ID)/2) +
+    facet_wrap(~StimType) +
+    theme_minimal() +
+    ggtitle("High Frequency Noise")
+
+smooth_time <- hp_time %>%
+  mutate(SmoothResponse = Response - hp)%>%
+  select(ID, StimType, SmoothResponse, Time, isSAC, peakT, riseT)
+
+roll_avN = 10
+smooth_time <- smooth_time %>%
+  group_by(StimType, isSAC, ID, peakT, riseT) %>%
+  mutate(SmoothResponse = zoo::rollapply(SmoothResponse, roll_avN, mean, align='right', fill=NA))%>%
+  ungroup() 
+
+# Visualize smooth time series by cluster
+smooth_time %>%
+  filter(StimType == "static") %>%
+  ggplot(aes(x = Time, y = SmoothResponse, group = ID, color = ID)) +
+  geom_line(alpha = 0.8)+
+  scale_color_gradient2(low = 'red', mid = 'green', high = 'purple', midpoint = max(df_time$ID)/2)+
+  ggtitle(paste0("Static Flash, Smoothed by HP filter and rolling average of ",roll_avN, " frames")) +
+  theme_minimal()
+```
+
+The following putative clustering relevant statistics were thus found. 
+
+```{r parameters}
+# Store the smoothed data
+df_time <- df_time %>%
+  mutate(Response = smooth_time$SmoothResponse)
+
+# Store summaries
+TransientStats <- df_time %>%
+  filter(StimType == "static" & Time > 2000 & Time <2500) %>%
+  group_by(ID) %>%
+  summarise(MeanTransient = mean(Response),
+            MedianTransient = median(Response),
+            SDTransient = sd(Response)) %>%
+  select(-ID)
+
+HyperStats <- df_time %>%
+  filter(StimType == "static" & Time > 3500 & Time <4500) %>%
+  group_by(ID) %>%
+  summarise(MeanHyper = mean(Response),
+            MedianHyper = median(Response),
+            SDHyper = sd(Response)) %>%
+  select(-ID)
+
+Rise <- df_time %>%
+  filter(Time < 750 ) %>%
+  group_by(ID) %>%
+  summarise(Rise = 1-mean(Response)) %>%
+  pull(Rise)
+
+startTimes = raw_df$riseT
+
+TShift <- df_time %>%
+  group_by(ID) %>%
+  mutate(Time = Time - startTimes[ID]) %>%
+  summarise(TShift = max(Time)) %>%
+  pull(TShift)
+
+# Approximate AUC
+AUC <- smooth_time %>%
+  drop_na() %>%
+  group_by(ID) %>%
+  filter(Time>(peakT*1000) & Time < ((peakT*1000)+500) & StimType == "static") %>%
+  mutate(AUC = sum(SmoothResponse)*(1000*mspf)) %>%
+  select(-Time, -SmoothResponse) %>%
+  ungroup() %>%
+  unique() %>%
+  pull(AUC)
+
+df_sum <- raw_df %>%
+  select(-starts_with("t", ignore.case = F), -Info)  %>%
+  cbind(TransientStats) %>%
+  cbind(HyperStats) %>%
+  mutate(difCenters = MeanTransient - MedianTransient,
+         Slope = Rise / (peakT - riseT),
+         TShift = TShift,
+         AUC = AUC,
+         ID = 1:nrow(raw_df))
+
+######################################################## Visualize distributions
+df_sum %>% 
+  # filter(isSAC == 0) %>%
+  select(-ID, -isSAC) %>%
+  tidyr::gather(Attributes, value) %>% 
+  ggplot(aes(x=value)) +
+  geom_histogram(fill = "lightblue2", color = "black") +
+  facet_wrap(~Attributes, scales = "free_x") +
+  labs(x = "Value", y = "Frequency") +
+  theme_minimal()
+
+df_sum %>% 
+  # filter(isSAC == 0) %>%
+  select(-ID, -isSAC) %>%
+  scale() %>%
+  as.data.frame() %>%
+  tidyr::gather(Attributes, Zscore) %>% 
+  ggplot(aes(x=Zscore, y = Attributes)) +
+  geom_violin(fill = "lightblue2", color = "black") +
+  geom_jitter(alpha = 0.05) + 
+  theme_minimal()
+
+
+# Temporarily extract boolean vectors so they are not standardized 
+Z_ids <- df_sum$ID
+SACs <- df_sum$isSAC
+# Subset and standardize all summary params for bp
+bp_Zsum <- df_sum %>%
+  select(-ID, -isSAC) %>%
+  scale() %>%
+  as.data.frame()
+
+# Visualize relationships
+corrplot::corrplot(cor(bp_Zsum), type = "upper", method = "ellipse", tl.cex = 0.9)
+
+# Add booleans back to summaries
+bp_Zsum <- bp_Zsum %>%
+  mutate(ID = Z_ids,
+         isSAC = SACs)
+# Remove boolean vectors
+remove(Z_ids)
+remove(SACs)
+```
+
+## Removal of Outliers 
+
+During exploration of the clustering outlier removal was considered, but was not implemented in the final analysis.
+
+```{r outliers}
+################################################################ Remove Outlines
+outliers <- NA
+# Extreme Param values
+# outliers <- bp_Zsum %>% 
+  # filter(RiseTau > 7.5)  |
+           # rise_MB > 10 |
+           # decay > 5) %>%
+  # pull(ID)
+
+# #Extreme noise observed in high pass filter
+# outliers <- hp_time %>%
+#   filter((StimType == "static" & Time > 3000 & hp > 0.7) |
+#            (StimType == "static" & Time > 3000 & hp < -0.75)) %>%
+#   pull(ID) %>%
+#   c(outliers)
+# Extreme Noise by threshold
+# outliers <- df_time %>% 
+#   filter((StimType == "static" & Time > 2500 & Response > 1.25) |
+#            (StimType == "static" & Time > 4500 & Response < -0.75)) %>%
+#   pull(ID) %>%
+#   c(outliers)
+
+# outliers <- unique(outliers)
+
+# # Visualize outiers
+# for( i in outliers) {
+#   graph <- df_time %>%
+#     filter(ID == i) %>%
+#     ggplot(aes(x = Time, y = Response, group = ID)) +
+#       geom_line() +
+#       geom_point() +
+#       ggtitle(i) +
+#       facet_grid(~StimType)
+#   print(graph)
+#   df_time %>%
+#     filter(ID == i) %>%
+#     select(Info, ID) %>%
+#     slice(1) %>%
+#     print()
+#   print(filter(bp_Zsum, ID == i))
+#   print("####################################")
+#   print("####################################")
+# }
+
+
+# remove outliers
+df_time_clean <- df_time %>%
+  filter(!(ID %in% outliers))
+bp_Zsum_clean <- bp_Zsum %>%
+  filter(!(ID %in% outliers))
+# Visualize timeseries without outliers
+# df_time_clean %>%
+#   # filter(isSAC == 0) %>%
+#   ggplot(aes(x = Time, y = Response, group = ID, color = ID)) +
+#     geom_line()+
+#     scale_color_gradient2(low = 'red', mid = 'green', high = 'purple', midpoint = max(df_time$ID)/2) +
+#     facet_wrap(~StimType) +
+#     theme_minimal()
+
+```
+
+
+
+## Clustering By Principal Parameters
+
+Principal component analysis was performed on the above computed statistics in an attempt to reduce the dimentionality of our clustering analysis. This PCA revealed 5 parameters could explain 80% of the variance; AUC, MeanTransient, TS2, riseT, and TShift. Instead of clustering based on the principal components themselves, we elected to perform hierarchical clustering using these predictors. becasue riseT and TShift demonstrated singularity when assessed in this way, riseT was replaced with peakT owing to the similar contribution and offset from TShift. We computed the maximum distance between each component and then used the Ward.D method of grouping clusters based on those that minimized total within-cluster variance. Finally, we used the classic C-index of Hubert and Levin (1976) to determine the optimal number of clusters. 
+
+```{r hclust}
+# Hierarchical clustering
+HClusterDisplay <- function(.data, distance, method, min.nc, max.nc, index,
+                            df_time = df_time, skipID = F,
+                            showStatic = T, showMotion = F, SACsummary = T, ClustSummary = T) {
+  # Compute clusters
+  if (skipID){
+    res.nbclust <- .data %>%
+      NbClust::NbClust(distance = distance,
+                       min.nc = min.nc, max.nc = max.nc, 
+                       method = method, index = index)
+  } else {
+    res.nbclust <- .data %>%
+      select(-isSAC, -ID) %>%
+      NbClust::NbClust(distance = distance,
+                       min.nc = min.nc, max.nc = max.nc, 
+                       method = method, index = index)
+  }
+  # Displya cluster visualization
+  if (index == "all") {
+    factoextra::fviz_nbclust(res.nbclust) +
+      theme_minimal() +
+      ggtitle(paste0("NbClust's optimal number of clusters, Hierarchical ", method, " by ", distance, " distance"))
+  } else {
+    Sindex <- data.frame(indexV = res.nbclust$All.index, NClusters = as.numeric(names(res.nbclust$All.index)))
+    Sindex <- ggplot(Sindex, aes(x = NClusters, y = indexV)) +
+      geom_point() +
+      geom_line() +
+      ggtitle(paste0(index, " Index")) +
+      theme_minimal()
+    print(Sindex)
+  }
+    
+  # Assign clusters to the time df
+  clusters <- data.frame(Cluster = res.nbclust$Best.partition, ID = .data$ID, isSAC = .data$isSAC)
+  df_time_clean <- df_time %>%
+    filter(ID %in% .data$ID) 
+  df_time_clean$Cluster <- clusters$Cluster[match(df_time_clean$ID, clusters$ID)]
+  
+  # Print SAC summary count
+  if (SACsummary) {
+    clusters %>%
+      group_by(Cluster) %>%
+      summarise(SACs = sum(isSAC),
+                N = n(),
+                SACprop = SACs/N) %>%
+      kableExtra::kbl() %>%
+      kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+      print()
+    
+  }
+  # Print cluster mean summary values
+  if (ClustSummary) {
+    df_time_clean %>%
+      select(-Time, -Response) %>%
+      unique()%>%
+      group_by(Cluster) %>%
+      summarise_all(mean) %>%
+      kableExtra::kbl() %>%
+      kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+      print()
+    
+  }
+  # Visualize time series by cluster
+  if (showStatic) {
+    showStatic <- df_time_clean %>%
+      filter(StimType == "static") %>%
+      ggplot(aes(x = Time, y = Response, group = ID, color = ID)) +
+      geom_line(alpha = 0.8)+
+      scale_color_gradient2(low = 'red', mid = 'green', high = 'purple', midpoint = max(df_time$ID)/2) +
+      facet_wrap(~Cluster)+
+      ggtitle("Static Flash Clusters") +
+      theme_minimal()
+    print(showStatic)
+  }
+  # Visualize time series of moving data by cluster
+  if (showMotion) {  
+    showMotion <- df_time_clean %>%
+      filter(StimType != "static") %>%
+      ggplot(aes(x = Time, y = Response, group = ID, color = ID)) +
+      geom_line(alpha = 0.8)+
+      scale_color_gradient2(low = 'red', mid = 'green', high = 'purple', midpoint = max(df_time$ID)/2) +
+      facet_wrap(~Cluster)+
+      ggtitle("Moving Stim Clusters") +
+      theme_minimal()
+    print(showMotion)
+  } 
+  return(df_time_clean)
+}
+
+# PCA
+PCA <- function(.data, var_explained = 0.8, print_outs = T, scale = F, center = T) {
+  # Compute PCA
+  pc.sum <- .data %>%
+    prcomp(scale = scale, center = center) 
+  
+  pc.var <- pc.sum$sd^2 # compute variance of each component
+  pve <- pc.var / sum(pc.var) #compute variance explained by each component
+  
+  index.var_explained <- which((cumsum(pve) >= var_explained)+0 > 0)[1]
+  
+  if (print_outs){
+    print(summary(pc.sum))
+    # Plot variance explained
+    par(mfrow = c(1, 2))
+    # Plot variance explained for each principal component
+    plot(pve, xlab = "Principal Component", 
+         ylab = "Proportion of Variance Explained", 
+         ylim = c(0, 1), type = "b")
+    
+    # Plot cumulative proportion of variance explained
+    plot(cumsum(pve), xlab = "Principal Component", 
+         ylab = "Cumulative Proportion of Variance Explained", 
+         ylim = c(0, 1), type = "b")
+    
+    # Plot factor contributions
+    var_plot <- factoextra::fviz_pca_var(pc.sum, col.var="contrib")+
+      scale_color_gradient2(low="white", mid="blue",
+                            high="red", midpoint=5) +
+      theme_minimal()
+    # Plot importance of components to observations
+    # Note: high cos^2 shows greater importance of a principal component for a given observation
+    ind_plot <- factoextra::fviz_pca_ind(pc.sum, label="none", col.ind="cos2",)+ #habillage=iris$Species,
+      # addEllipses=TRUE, ellipse.level=0.95) +
+      scale_color_gradient2(low="white", mid="blue",
+                            high="red", midpoint=0.5)+
+      theme_minimal()
+    # Plot biplot with most relevant factors
+    bi_plot <- factoextra::fviz_pca_biplot(pc.sum, label="var",  col.ind="cos2", select.var = list(contrib = index.var_explained))+# habillage=iris$Species,
+      #addEllipses=TRUE, ellipse.level=0.95) +
+      scale_color_gradient2(low="white", mid="blue",
+                            high="red", midpoint=.5) +
+      theme_minimal()
+    
+    print(var_plot)
+    print(ind_plot)
+    print(bi_plot)
+  }
+  return(pc.sum)
+}
+
+# Summaries
+pc.sum <- bp_Zsum_clean %>%
+  select(-ID,-isSAC,-Slope, -all_of(ends_with("MB")),-all_of(starts_with("Median")), -all_of(starts_with("SD"))) %>%
+  PCA(print_outs = T, var_explained = 0.8)
+# Clustering using the PCA indicated summary params
+df_sum_clust_hc_pc <- bp_Zsum_clean %>%
+  select(AUC, MeanTransient, TS2, peakT, TShift, ID, isSAC) %>% #riseT caused the matrix to be singular
+  HClusterDisplay(distance = "maximum", method = "ward.D", min.nc = 5, max.nc = 14, 
+                  index = "cindex", df_time = df_time, SACsummary = F, ClustSummary = F)
+
+clusts <- df_sum_clust_hc_pc %>%
+  select(-Response, - Time, - StimType) %>%
+  filter(!(ID %in% outliers)) %>%
+  unique() %>%
+  pull(Cluster)
+
+factoextra::fviz_pca_ind(pc.sum, label="none",  habillage=clusts,
+                         addEllipses=TRUE, ellipse.level=0.95) +
+  theme_minimal()
+```
+
+```{r summaryTable}
+  # Print SAC summary count
+  sac_sum <- df_sum_clust_hc_pc %>%
+    group_by(Cluster) %>%
+    summarise(SACs = sum(isSAC),
+              N = n(),
+              SACprop = SACs/N)
+
+  # Print cluster mean summary values
+  df_sum_clust_hc_pc %>%
+    select(-Time, -Response, -ID, -Info, -StimType, -isSAC, -isSAC_MB) %>%
+    unique()%>%
+    group_by(Cluster) %>%
+    summarise_all(mean) %>%
+    right_join(sac_sum, by = "Cluster") %>%
+    kableExtra::kbl() %>%
+    kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "condensed")) 
+```
+
+```{r unused, eval=FALSE}
+#To save outputs
+res.nb <- bp_Zsum_clean %>%
+  select(AUC, MeanTransient, TS2, peakT, TShift, ID, isSAC) %>%
+  NbClust::NbClust(distance = "maximum", method = "ward.D", min.nc = 5, max.nc = 14,
+                  index = "cindex")
+
+df_sum_clust_hc_pc %>%
+  select(Info, Cluster) %>%
+  unique() %>%
+  write.csv("/Users/Sam/Desktop/BP_Clustering/Clustered_on.csv")
+write.csv(res.nb$All.index, "/Users/Sam/Desktop/BP_Clustering/Clustered_off_cindex.csv")
+
+# The below are alternative clustering strategies that were considered but are not used
+# Cluster by manually chosen summary params
+df_time_clust_hc <- bp_Zsum_clean %>%
+  select(-difCenters, -sustained, -peak, -TS1, -MedianTransient, -MedianHyper, -SDHyper, -SDTransient, -all_of(ends_with("MB"))) %>%
+  HClusterDisplay(distance = "canberra", method = "complete", min.nc = 4, max.nc = 14, index = "all", df_time = df_time)
+
+
+# # Print info for cluster i 
+# df_time_clust_hc %>%
+#   filter(Cluster == 8) %>%
+#   group_by(ID) %>%
+#   select(Info) %>%
+#   slice(1) %>%
+#   print()
+
+
+# Hierarchical clustering of time series
+# Reorganize time series data for clustering
+smooth_time_spread <- smooth_time %>%
+  drop_na() %>%
+  filter(StimType == "static" & Time >1000 & Time < 2000) %>%
+  group_by(StimType, isSAC, ID) %>%
+  spread(key = Time, value = SmoothResponse) %>%
+  ungroup() %>%
+  select(-StimType)
+
+# # How to caluclate dtw, takes too long to be practical
+# ID_grid <- expand.grid(unique(smooth_time_spread$ID),unique(smooth_time_spread$ID))
+# ds <- smooth_time_spread %>%
+#   select(-ID, -isSAC) %>%
+#   split(smooth_time_spread$ID)
+# values <- expand.grid(ds,ds)
+# DTW_dist <- purrr::map_dbl(1:nrow(values), ~dtw::dtw(x = values$Var1[[1]], y = values$Var2[[1]])$distance)
+
+df_time_clust_hc <- smooth_time_spread %>%
+  # filter(isSAC == 1) %>%
+  HClusterDisplay(distance = "minkowski", method = "ward.D2", min.nc = 4, max.nc = 14, 
+                  index = "all", df_time = df_time, SACsummary = F)
+# 
+# # Assign clusters to the time df
+# clusters <- data.frame(Cluster = res.nbclust$Best.partition, ID = select(filter(smooth_time_spread, isSAC ==1),ID))
+
+# PCA
+PCA <- function(.data, var_explained = 0.8, print_outs = T, scale = F, center = T) {
+  # Compute PCA
+  pc.sum <- .data %>%
+    prcomp(scale = scale, center = center) 
+  
+  pc.var <- pc.sum$sd^2 # compute variance of each component
+  pve <- pc.var / sum(pc.var) #compute variance explained by each component
+  
+  index.var_explained <- which((cumsum(pve) >= var_explained)+0 > 0)[1]
+  
+  if (print_outs){
+    print(summary(pc.sum))
+    # Plot variance explained
+    par(mfrow = c(1, 2))
+    # Plot variance explained for each principal component
+    plot(pve, xlab = "Principal Component", 
+         ylab = "Proportion of Variance Explained", 
+         ylim = c(0, 1), type = "b")
+    
+    # Plot cumulative proportion of variance explained
+    plot(cumsum(pve), xlab = "Principal Component", 
+         ylab = "Cumulative Proportion of Variance Explained", 
+         ylim = c(0, 1), type = "b")
+    
+    # Plot factor contributions
+    var_plot <- factoextra::fviz_pca_var(pc.sum, col.var="contrib")+
+      scale_color_gradient2(low="white", mid="blue",
+                            high="red", midpoint=5) +
+      theme_minimal()
+    # Plot importance of components to observations
+    # Note: high cos^2 shows greater importance of a principal component for a given observation
+    ind_plot <- factoextra::fviz_pca_ind(pc.sum, label="none", col.ind="cos2",)+ #habillage=iris$Species,
+      # addEllipses=TRUE, ellipse.level=0.95) +
+      scale_color_gradient2(low="white", mid="blue",
+                            high="red", midpoint=0.5)+
+      theme_minimal()
+    # Plot biplot with most relevant factors
+    bi_plot <- factoextra::fviz_pca_biplot(pc.sum, label="var",  col.ind="cos2", select.var = list(contrib = index.var_explained))+# habillage=iris$Species,
+      #addEllipses=TRUE, ellipse.level=0.95) +
+      scale_color_gradient2(low="white", mid="blue",
+                            high="red", midpoint=.5) +
+      theme_minimal()
+    
+    print(var_plot)
+    print(ind_plot)
+    print(bi_plot)
+  }
+  return(pc.sum)
+}
+# distmeth =  "euclidean" # "maximum" "manhattan" "canberra" "binary" "minkowski"
+# clustmeth =  "ward.D" # "ward.D2", "single", "complete", "average" , "mcquitty" , "median" "centroid"
+# pc.tree <- hclust(dist(pc.sum$x[,1:index.var_explained], method = distmeth), method = clustmeth)
+# plot(pc.tree)
+# clusters <- cutree(pc.tree, k = 6)
+
+# Summaries
+pc.sum <- bp_Zsum_clean %>%
+  select(-ID,-isSAC, -all_of(ends_with("MB")),-all_of(starts_with("Median")), -all_of(starts_with("SD"))) %>%
+  PCA(print_outs = T, var_explained = 0.8)
+# Clustering using the PCA indicated summary params
+df_sum_clust_hc_pc <- bp_Zsum_clean %>%
+  select(riseT,peakT,TS2,TShift,MeanTransient, ID, isSAC) %>%
+  HClusterDisplay(distance = "euclidean", method = "ward.D2", min.nc = 4, max.nc = 16, 
+                  index = "all", df_time = df_time)
+
+clusts <- df_sum_clust_hc_pc %>%
+  select(-Response, - Time, - StimType) %>%
+  filter(!(ID %in% outliers)) %>%
+  unique() %>%
+  pull(Cluster)
+
+factoextra::fviz_pca_ind(pc.sum, label="none",  habillage=clusts,
+                         addEllipses=TRUE, ellipse.level=0.95) +
+  theme_minimal()
+# 
+# # Clustering using the PCA PCs directly
+# df_sum_clust_hc_pc <- pc.sum$x[,1:5] %>%
+#   HClusterDisplay(distance = "euclidean", method = "ward.D2", min.nc = 4, max.nc = 16, 
+#                   index = "all", df_time = df_time, skipID = T, 
+#                   showStatic = F, showMotion = F, SACsummary = F, ClustSummary = F)
+# 
+# test <- df_sum_clust_hc_pc %>%
+#     filter(StimType == "Static") %>%
+#     select(-Time, -Response, -StimType) %>%
+#     unique()%>%
+#     group_by(Cluster) %>%
+#     summarise(SACs = sum(isSAC),
+#               N = n(),
+#               SACprop = SACs/N) %>%
+#     kableExtra::kbl() %>%
+#     kableExtra::kable_classic()
+# # Print cluster mean summary values
+#   df_sum_clust_hc_pc %>%
+#     select(-Time, -Response) %>%
+#     unique()%>%
+#     group_by(Cluster) %>%
+#     summarise_all(mean) %>%
+#     kableExtra::kbl() %>%
+#     kableExtra::kable_classic()
+#   print(ClustSummary)
+# }
+# # Visualize time series by cluster
+# df_time_clean %>%
+#     filter(StimType == "static") %>%
+#     ggplot(aes(x = Time, y = Response, group = ID, color = ID)) +
+#     geom_line(alpha = 0.8)+
+#     scale_color_gradient2(low = 'red', mid = 'green', high = 'purple', midpoint = max(df_time$ID)/2) +
+#     facet_wrap(~Cluster)+
+#     ggtitle("Static Flash Clusters") +
+#     theme_minimal()
+# 
+# 
+# clusts <- df_sum_clust_hc_pc %>%
+#   select(-Response, - Time, - StimType) %>%
+#   filter(!(ID %in% outliers)) %>%
+#   unique() %>%
+#   pull(Cluster)
+# 
+# factoextra::fviz_pca_ind(pc.sum, label="none",  habillage=clusts,
+#                          addEllipses=TRUE, ellipse.level=0.95) +
+#   theme_minimal()
+
+## TIME
+pc.time <- smooth_time_spread %>%
+  select(-ID,-isSAC) %>%
+  PCA(print_outs = T, scale = T, var_explained = 0.9)
+
+res.nbclust <- pc.time$x[,1:5] %>%
+  NbClust::NbClust(distance = "euclidean",
+                   min.nc = 4, max.nc = 14,
+                   method = "ward.D2", index ="all")
+
+
+
+
+factoextra::fviz_nbclust(res.nbclust) +
+  theme_minimal() +
+  ggtitle("NbClust's optimal number of clusters, Complete Hierarchical")
+
+clusters <- data.frame(Cluster = res.nbclust$Best.partition, ID = smooth_time_spread$ID, isSAC = smooth_time_spread$isSAC) 
+
+df_time_clean <- df_time %>%
+  filter(ID %in% clusters$ID) 
+df_time_clean$Cluster <- clusters$Cluster[match(df_time_clean$ID, clusters$ID)]
+
+
+# Visualize time series by cluster
+df_time_clean %>%
+  filter(StimType == "static") %>%
+  ggplot(aes(x = Time, y = Response, group = ID, color = ID)) +
+  geom_line(alpha = 0.8)+
+  scale_color_gradient2(low = 'red', mid = 'green', high = 'purple', midpoint = max(df_time$ID)/2) +
+  facet_wrap(~Cluster)+
+  ggtitle("Static Flash Clusters") +
+  theme_minimal()
+
+factoextra::fviz_pca_ind(pc.time, label="none",  habillage=res.nbclust$Best.partition,
+                         addEllipses=TRUE, ellipse.level=0.95) +
+  theme_minimal()
+```
+
+```{r ref.label=knitr::all_labels(), echo=TRUE, eval=FALSE}
+```
